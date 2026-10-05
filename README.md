@@ -6,8 +6,6 @@ The problem it solves: when you work with coding agents across several checkouts
 
 ![workdocs-kit architecture: agent session, the kit, the content root, and the Claude Code hooks](docs/architecture.png)
 
-Source: [docs/architecture.excalidraw](docs/architecture.excalidraw) (open in [excalidraw.com](https://excalidraw.com) to edit).
-
 | Piece | Where | Role |
 |---|---|---|
 | Conventions | [CONVENTIONS.md](CONVENTIONS.md) | the spec: layout, per-project file contract, frontmatter, naming, completion protocol |
