@@ -2,7 +2,15 @@
 
 A convention plus a small CLI for keeping personal project documentation (notes, analyses, plans, reviews, agent handoffs, analysis scripts, downloaded artifacts) outside code repos, in a form any coding agent can pick up mid-project.
 
-The problem it solves: when you work with coding agents across several checkouts and branches, notes pile up as untracked files inside repos, each session starts without knowing what the last one found, and the state of a multi-week investigation lives only in your head. Workdocs puts every project in one place (`~/workdocs`, a local git repo), gives each project a fixed set of files an agent reads first (`HANDOFF.md`) and appends to (`LOG.md`), and maps the branch you are on to the right project automatically.
+## The problem it solves
+When you work with coding agents across several checkouts and branches, notes pile up as untracked files inside repos, each session starts without knowing what the last one found, and the state of a multi-week investigation lives only in your head. 
+
+What Workdocs does:
+- puts every project in one place (`~/workdocs`, a local git repo)
+- gives each project a fixed set of files
+- maintains 'entry point' for agents (`HANDOFF.md`)
+- enforces tracking history  (`LOG.md`)
+- maps the branch you are on to the right project automatically
 
 ![workdocs-kit architecture: agent session, the kit, the content root, and the Claude Code hooks](docs/architecture.png)
 
