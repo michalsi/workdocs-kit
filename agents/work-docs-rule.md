@@ -1,0 +1,7 @@
+## Work docs
+
+- Personal project/task docs (notes, analyses, plans, reviews, handoffs, ticket/chat drafts, analysis scripts, downloaded artifacts) live in `~/workdocs`, never in a code repo working tree. Exception: files a repo's own tooling writes (e.g. a test harness's `reports/`) and docs the code itself needs.
+- Before writing such a file, or when resuming work, find the project folder with `wd`, not by searching the filesystem: use the `[workdocs]` path from session-start context if present and the user has not named something else; otherwise run `wd where` (with the ticket key or project name the user mentioned, e.g. `wd where PROJ-1234` or `wd where phase-2`). One match: use it. None or several: ask the user once, then `wd new` or `wd link`.
+- In a project folder, read `HANDOFF.md` first. Follow `$(wd kit)/CONVENTIONS.md` (skill: `workdocs`).
+- Update the docs when it happens, not at the end: append a `LOG.md` entry (and update `HANDOFF.md` if status or next action changed) right after any of: a finding verified or a hypothesis ruled out, a decision made or approved by the user, a run/build started, finished, or failed, the plan or next action changed, before asking the user to wait or decide. A session can end or be compacted at any moment; anything not written down is lost.
+- Then `wd checkpoint -m "<unit>: <summary>"`. In Claude Code a Stop hook reminds you after ~20 tool calls without a docs update; treat it as a check, not as the trigger.

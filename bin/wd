@@ -1,0 +1,967 @@
+#!/usr/bin/env python3
+"""wd — workdocs CLI. Mechanics only; the rules live in CONVENTIONS.md next to this kit."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+KIT_DIR = Path(__file__).resolve().parent.parent
+TEMPLATES = KIT_DIR / "templates"
+
+ALLOWED_KEYS = {"kind", "title", "status", "jira", "repos", "branches", "waiting_on", "ping_after", "created"}
+LIST_KEYS = {"jira", "repos", "branches", "waiting_on"}
+KINDS = {"epic", "project", "review", "note"}
+STATUSES = {"active", "waiting", "paused", "done"}
+
+# Score tiers for `wd where`; higher wins.
+SCORE_TERM_KEY = 5
+SCORE_TERM_NAME = 4
+SCORE_BRANCH = 3
+SCORE_BRANCH_KEY = 2
+SCORE_REPO = 1
+
+EXIT_OK, EXIT_NONE, EXIT_AMBIGUOUS = 0, 2, 3
+
+NOTE_EXTENSIONS = {
+    ".md", ".txt", ".log", ".csv", ".tsv", ".json", ".jsonl", ".patch", ".diff", ".html", ".png", ".jpg",
+    ".jpeg", ".svg", ".pdf", ".ipynb", ".excalidraw", ".gz", ".zip", ".tar", ".sha256", ".gdoc", ".xlsx",
+}
+
+
+# ---------------------------------------------------------------- config
+
+def load_config(env: dict | None = None) -> dict:
+    env = dict(os.environ if env is None else env)
+    path = Path(env.get("WORKDOCS_CONFIG", "~/.config/workdocs/config")).expanduser()
+    cfg = {
+        "WORKDOCS_ROOT": "~/workdocs",
+        "WORKDOCS_DATA": "",
+        "JIRA_KEY_REGEX": r"[A-Z][A-Z0-9]+-[0-9]+",
+        "TRUNK_BRANCHES": "main master stage dev develop prod release HEAD",
+        "AUDIT_REPOS": "",
+        "JIRA_PROJECTS": "",
+        "NUDGE_AFTER": "20",
+        "STATE_DIR": "~/.cache/workdocs",
+    }
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            cfg[key.strip()] = value.strip().strip('"').strip("'")
+    for key in list(cfg):
+        if key in env:
+            cfg[key] = env[key]
+    expand_env = dict(env)
+    for key in ("WORKDOCS_ROOT", "WORKDOCS_DATA", "AUDIT_REPOS", "STATE_DIR"):
+        cfg[key] = _expand(cfg[key], expand_env)
+        expand_env[key] = cfg[key]
+    if not cfg["WORKDOCS_DATA"]:
+        cfg["WORKDOCS_DATA"] = str(Path(cfg["WORKDOCS_ROOT"]) / "data")
+    return cfg
+
+
+def _expand(value: str, env: dict) -> str:
+    def repl(m: re.Match) -> str:
+        name = m.group(1) or m.group(2)
+        return env.get(name, m.group(0))
+    value = re.sub(r"\$\{(\w+)\}|\$(\w+)", repl, value)
+    parts = [os.path.expanduser(p) for p in value.split(":")] if value else []
+    return ":".join(parts)
+
+
+# ---------------------------------------------------------------- frontmatter
+
+def parse_frontmatter(text: str) -> dict | None:
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None
+    meta: dict = {}
+    for raw in text[4:end].splitlines():
+        line = re.sub(r"\s+#.*$", "", raw).rstrip()
+        if not line.strip() or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key, value = key.strip(), value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            inner = value[1:-1].strip()
+            meta[key] = [v.strip().strip('"').strip("'") for v in inner.split(",") if v.strip()] if inner else []
+        else:
+            meta[key] = value.strip('"').strip("'")
+    return meta
+
+
+def format_value(value) -> str:
+    if isinstance(value, list):
+        return "[" + ", ".join(value) + "]"
+    return str(value)
+
+
+def update_frontmatter(path: Path, updates: dict) -> None:
+    text = path.read_text()
+    if parse_frontmatter(text) is None:
+        raise ValueError(f"{path}: no frontmatter")
+    end = text.find("\n---", 3)
+    lines = text[4:end].splitlines()
+    seen = set()
+    for i, raw in enumerate(lines):
+        key = raw.split(":", 1)[0].strip()
+        if key in updates:
+            comment = re.search(r"\s+#.*$", raw)
+            lines[i] = f"{key}: {format_value(updates[key])}" + (comment.group(0) if comment else "")
+            seen.add(key)
+    for key, value in updates.items():
+        if key not in seen:
+            lines.append(f"{key}: {format_value(value)}")
+    path.write_text("---\n" + "\n".join(lines) + text[end:])
+
+
+# ---------------------------------------------------------------- units
+
+@dataclass
+class Unit:
+    root: Path
+    path: Path          # README.md for directories, the file itself for notes/reviews
+    meta: dict
+
+    @property
+    def is_dir(self) -> bool:
+        return self.path.name == "README.md" and self.path.parent != self.root
+
+    @property
+    def location(self) -> Path:
+        return self.path.parent if self.is_dir else self.path
+
+    @property
+    def rel(self) -> str:
+        return str(self.location.relative_to(self.root))
+
+    @property
+    def depth(self) -> int:
+        return len(Path(self.rel).parts) - 1
+
+    @property
+    def kind(self) -> str:
+        return self.meta.get("kind", "")
+
+    @property
+    def status(self) -> str:
+        return self.meta.get("status", "")
+
+    @property
+    def title(self) -> str:
+        return self.meta.get("title", "")
+
+    def get_list(self, key: str) -> list:
+        value = self.meta.get(key, [])
+        return value if isinstance(value, list) else [value] if value else []
+
+    def is_ancestor_of(self, other: "Unit") -> bool:
+        return self.is_dir and other.rel.startswith(self.rel + "/")
+
+
+def iter_units(root: Path) -> list[Unit]:
+    units = []
+    candidates = sorted(root.glob("projects/*/README.md")) + sorted(root.glob("projects/*/*/README.md"))
+    candidates += sorted(root.glob("reviews/*.md")) + sorted(root.glob("notes/*.md"))
+    for path in candidates:
+        try:
+            meta = parse_frontmatter(path.read_text(errors="replace"))
+        except OSError:
+            continue
+        if meta is None or meta.get("kind") not in KINDS:
+            continue
+        units.append(Unit(root, path, meta))
+    return units
+
+
+def find_unit(units: list[Unit], term: str) -> list[Unit]:
+    term_l = term.lower().rstrip("/")
+    exact = [u for u in units if u.rel.lower() == term_l or u.rel.lower() == f"projects/{term_l}"]
+    if exact:
+        return exact
+    return [u for u in units if term_l in u.rel.lower() or term_l in u.title.lower()
+            or term.upper() in [k.upper() for k in u.get_list("jira")]]
+
+
+# ---------------------------------------------------------------- jira keys
+
+def extract_keys(text: str, key_regex: str, projects: str = "") -> set[str]:
+    """Jira keys in free text (branch or file names). Case-insensitive; drops date-like
+    numbers (7+ digits) and, when JIRA_PROJECTS is configured, unknown project prefixes."""
+    allowed = {p.upper() for p in projects.split()}
+    keys = set()
+    for m in re.finditer(key_regex, text, re.I):
+        key = m.group(0).upper()
+        prefix, _, number = key.rpartition("-")
+        if len(number) >= 7 or (allowed and prefix not in allowed):
+            continue
+        keys.add(key)
+    return keys
+
+
+# ---------------------------------------------------------------- git
+
+@dataclass
+class GitContext:
+    toplevel: Path
+    repo: str
+    branch: str | None
+
+
+def _git(cwd: Path, *args: str) -> str | None:
+    try:
+        out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def git_context(cwd: Path) -> GitContext | None:
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if not top:
+        return None
+    url = _git(cwd, "remote", "get-url", "origin")
+    repo = re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1]) if url else Path(top).name
+    branch = _git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD")
+    return GitContext(Path(top), repo, branch)
+
+
+# ---------------------------------------------------------------- resolution
+
+def resolve(units: list[Unit], repo: str | None, branch: str | None, terms: list[str],
+            key_regex: str, include_done: bool = False, projects: str = "") -> list[Unit]:
+    key_re = re.compile(key_regex)
+    branch_keys = extract_keys(branch or "", key_regex, projects)
+    term_keys = {t.upper() for t in terms if key_re.fullmatch(t.upper())}
+    term_names = [t.lower() for t in terms if not key_re.fullmatch(t.upper())]
+
+    scored: list[tuple[int, Unit]] = []
+    for u in units:
+        if u.status == "done" and not include_done:
+            continue
+        jira = {k.upper() for k in u.get_list("jira")}
+        score = 0
+        if term_keys & jira:
+            score = SCORE_TERM_KEY
+        elif term_names and any(n in u.rel.lower() or n in u.title.lower() for n in term_names):
+            score = SCORE_TERM_NAME
+        elif not terms:
+            if branch and branch in u.get_list("branches"):
+                score = SCORE_BRANCH
+            elif branch_keys & jira:
+                score = SCORE_BRANCH_KEY
+            elif repo and repo in u.get_list("repos"):
+                score = SCORE_REPO
+        if score:
+            scored.append((score, u))
+    if not scored:
+        return []
+    top = max(s for s, _ in scored)
+    cands = [u for s, u in scored if s == top]
+    cands = [u for u in cands if not any(u.is_ancestor_of(o) for o in cands if o is not u)]
+    # A repo usually hosts many projects, so a repo-only match counts only when it is unique.
+    if top == SCORE_REPO and len(cands) > 1:
+        return []
+    return cands
+
+
+def epic_of(unit: Unit, units: list[Unit]) -> Unit | None:
+    for u in units:
+        if u.is_ancestor_of(unit):
+            return u
+    return None
+
+
+# ---------------------------------------------------------------- summaries
+
+def last_log_date(unit: Unit) -> str:
+    if unit.is_dir:
+        log = unit.location / "LOG.md"
+        if log.is_file():
+            m = re.search(r"^## (\d{4}-\d{2}-\d{2})", log.read_text(errors="replace"), re.M)
+            if m:
+                return m.group(1)
+        return unit.meta.get("created", "")
+    m = re.search(r"_(\d{8})", unit.path.name)
+    if m:
+        d = m.group(1)
+        return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return unit.meta.get("created", "")
+
+
+def next_action(unit: Unit) -> str:
+    if not unit.is_dir:
+        return ""
+    handoff = unit.location / "HANDOFF.md"
+    if not handoff.is_file():
+        return "(no HANDOFF.md)"
+    text = handoff.read_text(errors="replace")
+    m = re.search(r"^## Next action[^\n]*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    if not m:
+        return ""
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if line:
+            return re.sub(r"^(\d+\.|[-*])\s*", "", line)
+    return ""
+
+
+def unit_row(unit: Unit) -> dict:
+    return {
+        "path": unit.rel, "kind": unit.kind, "status": unit.status, "title": unit.title,
+        "last": last_log_date(unit), "next": next_action(unit),
+    }
+
+
+# ---------------------------------------------------------------- lint
+
+LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+
+
+LIVING_FILES = {"README.md", "HANDOFF.md", "LOG.md", "DECISIONS.md"}
+
+
+def lint(root: Path, all_links: bool = False) -> list[str]:
+    problems = []
+    units = iter_units(root)
+    for u in units:
+        unknown = set(u.meta) - ALLOWED_KEYS
+        if unknown:
+            problems.append(f"{u.rel}: unknown frontmatter keys {sorted(unknown)}")
+        if u.kind not in KINDS:
+            problems.append(f"{u.rel}: invalid kind {u.kind!r}")
+        if u.status not in STATUSES:
+            problems.append(f"{u.rel}: invalid status {u.status!r}")
+        if u.status == "waiting" and not u.meta.get("ping_after"):
+            problems.append(f"{u.rel}: status waiting without ping_after")
+        if u.status == "waiting" and not u.get_list("waiting_on"):
+            problems.append(f"{u.rel}: status waiting without waiting_on")
+        if u.is_dir and u.kind in ("epic", "project"):
+            for required in ("HANDOFF.md", "LOG.md"):
+                if not (u.location / required).is_file():
+                    problems.append(f"{u.rel}: missing {required}")
+    for top in ("projects", "reviews", "notes"):
+        base = root / top
+        if not base.is_dir():
+            continue
+        for md in base.rglob("*.md"):
+            rel_parts = md.relative_to(root).parts
+            if "archive" in rel_parts or "reviews" in rel_parts[1:]:
+                continue
+            # Imported content often carries links that were already broken; by default only
+            # check the files workdocs itself maintains, plus single-file notes and reviews.
+            if not all_links and top == "projects" and md.name not in LIVING_FILES:
+                continue
+            problems.extend(_broken_links(root, md))
+    return problems
+
+
+def _broken_links(root: Path, md: Path) -> list[str]:
+    out = []
+    in_fence = False
+    for n, line in enumerate(md.read_text(errors="replace").splitlines(), 1):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        for target in LINK_RE.findall(re.sub(r"`[^`]*`", "", line)):
+            if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#") or target.startswith("/"):
+                continue
+            target = target.split("#", 1)[0]
+            target = re.sub(r":\d+(-\d+)?$", "", target)
+            if target and not (md.parent / target).exists():
+                out.append(f"{md.relative_to(root)}:{n}: broken link {target}")
+    return out
+
+
+# ---------------------------------------------------------------- audit
+
+def audit_repo(repo: Path, key_regex: str = r"[A-Z][A-Z0-9]+-[0-9]+", projects: str = "") -> list[dict]:
+    out = _git(repo, "status", "--porcelain", "--untracked-files=normal")
+    if out is None:
+        return [{"path": str(repo), "error": "not a git repo"}]
+    entries = []
+    for line in out.splitlines():
+        if not line.startswith("?? "):
+            continue
+        rel = line[3:].strip().strip('"')
+        full = repo / rel
+        if full.is_dir():
+            files = [p for p in full.rglob("*") if p.is_file()]
+            n = len(files)
+            noteish = sum(1 for p in files if p.suffix.lower() in NOTE_EXTENSIONS)
+            kind = "artifacts" if n > 50 or re.search(r"artifact|results|metrics", rel) else (
+                "notes" if n and noteish == n else "mixed" if noteish else "code?")
+        else:
+            n = 1
+            kind = "notes" if full.suffix.lower() in NOTE_EXTENSIONS else "code?"
+        keys = sorted(extract_keys(rel, key_regex, projects))
+        entries.append({"path": rel, "files": n, "class": kind, "keys": keys})
+    return entries
+
+
+# ---------------------------------------------------------------- git in root
+
+def checkpoint(root: Path, message: str | None, auto: bool) -> int:
+    if not (root / ".git").exists():
+        print(f"wd: {root} is not a git repo", file=sys.stderr)
+        return 1
+    if _git(root, "status", "--porcelain") == "":
+        if not auto:
+            print("clean")
+        return 0
+    msg = message or f"checkpoint {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}" + (" (auto)" if auto else "")
+    for attempt in range(3):
+        add = subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True, text=True)
+        commit = subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", msg], capture_output=True, text=True)
+        if add.returncode == 0 and commit.returncode == 0:
+            if not auto:
+                print(_git(root, "log", "-1", "--oneline"))
+            return 0
+        if "index.lock" not in (add.stderr + commit.stderr):
+            print((add.stderr + commit.stderr).strip(), file=sys.stderr)
+            return 1
+        time.sleep(1 + attempt)
+    print("wd: git index locked; gave up after 3 attempts", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------- scaffolding
+
+def render(template: str, values: dict) -> str:
+    text = (TEMPLATES / template).read_text()
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", format_value(value))
+    return text
+
+
+def today() -> str:
+    return dt.date.today().isoformat()
+
+
+def slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def git_defaults(cfg: dict, cwd: Path, with_branch: bool) -> tuple[list, list]:
+    ctx = git_context(cwd)
+    if not ctx:
+        return [], []
+    trunks = set(cfg["TRUNK_BRANCHES"].split())
+    branches = [ctx.branch] if with_branch and ctx.branch and ctx.branch not in trunks else []
+    return [ctx.repo], branches
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_root(cfg, args) -> int:
+    print(cfg["WORKDOCS_ROOT"])
+    return 0
+
+
+def cmd_kit(cfg, args) -> int:
+    print(KIT_DIR)
+    return 0
+
+
+def cmd_where(cfg, args) -> int:
+    root = Path(cfg["WORKDOCS_ROOT"])
+    units = iter_units(root)
+    cwd = Path(args.cwd or os.getcwd())
+    ctx = git_context(cwd)
+    if not ctx and not args.terms:
+        if args.json:
+            print("[]")
+        else:
+            print("wd: not in a git repo; pass a key or name", file=sys.stderr)
+        return EXIT_NONE
+    found = resolve(units, ctx.repo if ctx else None, ctx.branch if ctx else None, args.terms,
+                    cfg["JIRA_KEY_REGEX"], include_done=args.all,
+                    projects=cfg["JIRA_PROJECTS"])
+    if args.json:
+        rows = []
+        for u in found:
+            row = unit_row(u)
+            row["abs"] = str(u.location)
+            epic = epic_of(u, units)
+            row["epic"] = str(epic.location) if epic else None
+            rows.append(row)
+        print(json.dumps(rows, indent=1))
+    elif len(found) == 1:
+        u = found[0]
+        print(u.location)
+        epic = epic_of(u, units)
+        if epic and args.verbose:
+            print(f"epic: {epic.location}")
+    elif found:
+        print("wd: several matches:", file=sys.stderr)
+        for u in found:
+            print(f"  {u.location}  ({u.status})", file=sys.stderr)
+    else:
+        what = " ".join(args.terms) if args.terms else f"{ctx.repo}@{ctx.branch}"
+        print(f"wd: no unit matches {what}", file=sys.stderr)
+    return EXIT_OK if len(found) == 1 else EXIT_AMBIGUOUS if found else EXIT_NONE
+
+
+def cmd_new(cfg, args) -> int:
+    root = Path(cfg["WORKDOCS_ROOT"])
+    name = args.name.strip("/")
+    jira = [k.strip().upper() for k in (args.jira or "").split(",") if k.strip()]
+    for k in sorted(extract_keys(name, cfg["JIRA_KEY_REGEX"], cfg["JIRA_PROJECTS"])):
+        if k not in jira:
+            jira.insert(0, k)
+    repos, branches = git_defaults(cfg, Path(os.getcwd()), with_branch=not args.no_branch and args.kind in ("project", "epic"))
+    if args.no_git:
+        repos, branches = [], []
+    title = args.title or name
+    values = {"kind": args.kind, "title": title, "jira": jira, "repos": repos, "branches": branches,
+              "date": today(), "agent": args.agent}
+    if args.kind in ("project", "epic"):
+        base = root / "projects"
+        if args.epic:
+            epics = [u for u in find_unit(iter_units(root), args.epic) if u.kind == "epic"]
+            if len(epics) != 1:
+                print(f"wd: --epic {args.epic!r} matched {len(epics)} epics", file=sys.stderr)
+                return 1
+            base = epics[0].location
+        target = base / name
+        if target.exists():
+            print(f"wd: {target} already exists", file=sys.stderr)
+            return 1
+        target.mkdir(parents=True)
+        for tpl in ("README.md", "HANDOFF.md", "LOG.md"):
+            (target / tpl).write_text(render(tpl, values))
+        print(target)
+        return 0
+    folder = root / ("reviews" if args.kind == "review" else "notes")
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = f"{name}_{today().replace('-', '')}" + (f"_{slugify(args.slug)}" if args.slug else "")
+    target = folder / f"{stem}.md"
+    if target.exists():
+        print(f"wd: {target} already exists", file=sys.stderr)
+        return 1
+    target.write_text(render(f"{args.kind}.md", values))
+    print(target)
+    return 0
+
+
+def cmd_link(cfg, args) -> int:
+    root = Path(cfg["WORKDOCS_ROOT"])
+    matches = [u for u in find_unit(iter_units(root), args.unit) if u.is_dir]
+    if len(matches) != 1:
+        print(f"wd: {args.unit!r} matched {len(matches)} project dirs", file=sys.stderr)
+        for u in matches:
+            print(f"  {u.rel}", file=sys.stderr)
+        return 1
+    u = matches[0]
+    ctx = git_context(Path(args.cwd or os.getcwd()))
+    if not ctx or not ctx.branch:
+        print("wd: not on a git branch", file=sys.stderr)
+        return 1
+    if ctx.branch in cfg["TRUNK_BRANCHES"].split() and not args.force:
+        print(f"wd: refusing to link trunk branch {ctx.branch!r} (use --force)", file=sys.stderr)
+        return 1
+    repos, branches = u.get_list("repos"), u.get_list("branches")
+    if ctx.repo not in repos:
+        repos.append(ctx.repo)
+    if ctx.branch not in branches:
+        branches.append(ctx.branch)
+    update_frontmatter(u.path, {"repos": repos, "branches": branches})
+    print(f"linked {ctx.repo}@{ctx.branch} -> {u.rel}")
+    return 0
+
+
+def cmd_promote(cfg, args) -> int:
+    root = Path(cfg["WORKDOCS_ROOT"])
+    src = Path(args.file).expanduser().resolve()
+    meta = parse_frontmatter(src.read_text()) if src.is_file() else None
+    if not meta or meta.get("kind") not in ("note", "review"):
+        print(f"wd: {src} is not a note or review with frontmatter", file=sys.stderr)
+        return 1
+    name = args.name or re.sub(r"_\d{8}(_|$)", r"\1", src.stem).replace("_", "-").strip("-")
+    base = root / "projects"
+    if args.epic:
+        epics = [u for u in find_unit(iter_units(root), args.epic) if u.kind == "epic"]
+        if len(epics) != 1:
+            print(f"wd: --epic {args.epic!r} matched {len(epics)} epics", file=sys.stderr)
+            return 1
+        base = epics[0].location
+    target = base / name
+    if target.exists():
+        print(f"wd: {target} already exists", file=sys.stderr)
+        return 1
+    text = src.read_text()
+    body = text[text.find("\n---", 3) + 4:].lstrip("\n")
+    values = {"kind": "project", "title": meta.get("title", name), "jira": meta.get("jira", []),
+              "repos": meta.get("repos", []), "branches": meta.get("branches", []), "date": today(),
+              "agent": args.agent}
+    target.mkdir(parents=True)
+    for tpl in ("README.md", "HANDOFF.md", "LOG.md"):
+        (target / tpl).write_text(render(tpl, values))
+    first = target / f"01-{slugify(meta.get('kind', 'note'))}-{slugify(src.stem)}.md"
+    first.write_text(body)
+    log = target / "LOG.md"
+    log.write_text(log.read_text().replace(
+        "- Done: scaffolded with `wd new`.",
+        f"- Done: promoted from `{src.relative_to(root) if src.is_relative_to(root) else src}` "
+        f"(created {meta.get('created', '?')}); content is now [{first.name}]({first.name}).",
+    ))
+    src.unlink()
+    print(target)
+    return 0
+
+
+def cmd_ls(cfg, args) -> int:
+    root = Path(cfg["WORKDOCS_ROOT"])
+    rows = [unit_row(u) for u in iter_units(root) if args.all or u.status != "done"]
+    rows.sort(key=lambda r: r["last"], reverse=True)
+    if args.json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    if not rows:
+        print("(no units)")
+        return 0
+    w = max(len(r["path"]) for r in rows)
+    for r in rows:
+        nxt = (r["next"][:70] + "…") if len(r["next"]) > 71 else r["next"]
+        print(f"{r['path']:<{w}}  {r['status']:<7} {r['last']:<10}  {nxt}")
+    return 0
+
+
+def cmd_index(cfg, args) -> int:
+    root = Path(cfg["WORKDOCS_ROOT"])
+    units = iter_units(root)
+    active = sorted((unit_row(u) for u in units if u.status != "done"), key=lambda r: r["last"], reverse=True)
+    done = sum(1 for u in units if u.status == "done")
+    lines = ["# Index", "", f"Generated by `wd index` on {today()}. Do not edit by hand.", "",
+             "| Unit | Kind | Status | Last log | Next action |", "|---|---|---|---|---|"]
+    for r in active:
+        link = r["path"] + ("/HANDOFF.md" if (root / r["path"]).is_dir() else "")
+        nxt = r["next"].replace("|", "\\|")
+        lines.append(f"| [{r['path']}]({link}) | {r['kind']} | {r['status']} | {r['last']} | {nxt} |")
+    lines += ["", f"{done} unit(s) with status done are not listed (`wd ls --all`)."]
+    (root / "INDEX.md").write_text("\n".join(lines) + "\n")
+    print(root / "INDEX.md")
+    return 0
+
+
+def cmd_lint(cfg, args) -> int:
+    problems = lint(Path(cfg["WORKDOCS_ROOT"]), all_links=args.all_links)
+    for p in problems:
+        print(p)
+    if not problems:
+        print("ok")
+    return 1 if problems else 0
+
+
+def cmd_audit(cfg, args) -> int:
+    repos = args.repos or [r for r in cfg["AUDIT_REPOS"].split(":") if r]
+    report = {r: audit_repo(Path(r).expanduser(), cfg["JIRA_KEY_REGEX"], cfg["JIRA_PROJECTS"]) for r in repos}
+    if args.json:
+        print(json.dumps(report, indent=1))
+        return 0
+    total = 0
+    for repo, entries in report.items():
+        print(f"== {repo}  ({len(entries)} untracked entries)")
+        for e in entries:
+            if "error" in e:
+                print(f"   {e['error']}")
+                continue
+            total += 1
+            keys = ",".join(e["keys"])
+            print(f"   {e['class']:<9} {e['files']:>5}  {e['path']}" + (f"  [{keys}]" if keys else ""))
+    return 0 if total == 0 else 1
+
+
+def cmd_checkpoint(cfg, args) -> int:
+    return checkpoint(Path(cfg["WORKDOCS_ROOT"]), args.message, args.auto)
+
+
+def cmd_data(cfg, args) -> int:
+    root = Path(cfg["WORKDOCS_ROOT"])
+    matches = find_unit(iter_units(root), args.unit)
+    if len(matches) != 1:
+        print(f"wd: {args.unit!r} matched {len(matches)} units", file=sys.stderr)
+        return 1
+    rel = Path(matches[0].rel)
+    rel = Path(*rel.parts[1:]) if rel.parts[0] == "projects" else rel.with_suffix("")
+    path = Path(cfg["WORKDOCS_DATA"]) / rel
+    path.mkdir(parents=True, exist_ok=True)
+    print(path)
+    return 0
+
+
+# ---------------------------------------------------------------- session transcript analysis
+
+# Tool calls that are bookkeeping rather than work; they do not count toward the nudge.
+NON_WORK_TOOLS = {"ToolSearch", "TodoWrite", "Skill", "ScheduleWakeup", "AskUserQuestion", "ExitPlanMode", "EnterPlanMode"}
+DOC_EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+STATE_FILES = {"LOG.md", "HANDOFF.md"}
+
+
+@dataclass
+class SessionActivity:
+    tool_calls: int = 0           # work tool calls in the main thread
+    last_docs_update: int = -1    # index of the last tool call that wrote LOG/HANDOFF (or ran wd new/checkpoint)
+    unit_dir: Path | None = None  # most recently touched workdocs unit directory
+
+
+def unit_dir_for_path(units: list[Unit], path: Path) -> Path | None:
+    best = None
+    for u in units:
+        if u.is_dir and (path == u.location or u.location in path.parents):
+            if best is None or len(u.location.parts) > len(best.parts):
+                best = u.location
+    return best
+
+
+def analyse_transcript(transcript: Path, root: Path, units: list[Unit]) -> SessionActivity:
+    act = SessionActivity()
+    root_s = str(root)
+    home = str(Path.home())
+    path_re = re.compile(re.escape(root_s) + r"/[^\s'\"`)]+")
+    try:
+        lines = transcript.open(errors="replace")
+    except OSError:
+        return act
+    with lines:
+        for line in lines:
+            if '"tool_use"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if entry.get("type") != "assistant" or entry.get("isSidechain"):
+                continue
+            content = (entry.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "tool_use":
+                    continue
+                name, inp = item.get("name", ""), item.get("input") or {}
+                if name in NON_WORK_TOOLS:
+                    continue
+                index = act.tool_calls
+                act.tool_calls += 1
+                text = " ".join(str(v) for v in inp.values() if isinstance(v, str))
+                text = text.replace("${HOME}", home).replace("$HOME", home).replace("~/", home + "/")
+                paths = [Path(p) for p in path_re.findall(text)]
+                if isinstance(inp.get("file_path"), str):
+                    paths.append(Path(inp["file_path"]))
+                for p in paths:
+                    d = unit_dir_for_path(units, p)
+                    if d:
+                        act.unit_dir = d
+                wrote_state = name in DOC_EDIT_TOOLS and Path(str(inp.get("file_path", ""))).name in STATE_FILES \
+                    and str(inp.get("file_path", "")).startswith(root_s)
+                if name == "Bash":
+                    cmd = str(inp.get("command", ""))
+                    # Absolute paths, or relative LOG.md/HANDOFF.md after a `cd` into a unit.
+                    names_state = any(p.name in STATE_FILES for p in paths) or (
+                        bool(paths) and re.search(r"\b(LOG|HANDOFF)\.md\b", cmd))
+                    if re.search(r"\bwd (checkpoint|new|promote)\b", cmd) or (
+                            names_state and re.search(r"(>|sed -i|write_text|tee )", cmd)):
+                        wrote_state = True
+                if wrote_state:
+                    act.last_docs_update = index
+    return act
+
+
+def _state_path(cfg, session_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", session_id or "unknown")
+    return Path(cfg["STATE_DIR"]) / "stop" / f"{safe}.json"
+
+
+def stop_decision(cfg, payload: dict) -> str | None:
+    """Return a reason to keep the agent working on docs, or None to let it stop."""
+    if payload.get("stop_hook_active"):
+        return None
+    transcript = payload.get("transcript_path")
+    root = Path(cfg["WORKDOCS_ROOT"])
+    if not transcript or not root.is_dir():
+        return None
+    units = iter_units(root)
+    act = analyse_transcript(Path(transcript), root, units)
+    unit_dir = act.unit_dir
+    if unit_dir is None:
+        ctx = git_context(Path(payload.get("cwd") or os.getcwd()))
+        if ctx:
+            found = resolve(units, ctx.repo, ctx.branch, [], cfg["JIRA_KEY_REGEX"], projects=cfg["JIRA_PROJECTS"])
+            if len(found) == 1 and found[0].is_dir:
+                unit_dir = found[0].location
+    if unit_dir is None:
+        return None
+    state_file = _state_path(cfg, payload.get("session_id", ""))
+    try:
+        state = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        state = {}
+    baseline = max(act.last_docs_update, state.get("nudged_at", -1))
+    since = act.tool_calls - 1 - baseline
+    if since < int(cfg["NUDGE_AFTER"]):
+        return None
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps({"nudged_at": act.tool_calls - 1, "unit": str(unit_dir)}))
+    return (f"[workdocs] {since} tool calls since {unit_dir}/LOG.md or HANDOFF.md was last updated in this session. "
+            "If anything durable happened since then (a finding verified, a decision made, a run started/finished/failed, "
+            "the plan or next action changed), append a LOG.md entry and update HANDOFF.md now, following "
+            "CONVENTIONS.md, then finish your reply. If nothing durable happened, finish without editing and do not "
+            "mention this check.")
+
+
+def compact_lines(cfg, payload: dict, cwd: Path) -> list[str]:
+    root = Path(cfg["WORKDOCS_ROOT"])
+    unit_dir = None
+    if payload.get("transcript_path") and root.is_dir():
+        unit_dir = analyse_transcript(Path(payload["transcript_path"]), root, iter_units(root)).unit_dir
+    where = f"{unit_dir}/LOG.md and HANDOFF.md" if unit_dir else "the workdocs project for this work (if any)"
+    return [f"[workdocs] Context was just compacted. Before continuing, check that findings, decisions, and results "
+            f"from before the compaction are recorded in {where}; write any missing ones from the summary now."]
+
+
+def session_start_lines(cfg, cwd: Path) -> list[str]:
+    ctx = git_context(cwd)
+    if not ctx:
+        return []
+    root = Path(cfg["WORKDOCS_ROOT"])
+    if not root.is_dir():
+        return []
+    units = iter_units(root)
+    found = resolve(units, ctx.repo, ctx.branch, [], cfg["JIRA_KEY_REGEX"], projects=cfg["JIRA_PROJECTS"])
+    where = f"{ctx.repo}@{ctx.branch or 'detached'}"
+    if len(found) == 1:
+        u = found[0]
+        lines = [f"[workdocs] {where} → {u.location} ({u.kind}, {u.status}). Read its HANDOFF.md before project work."]
+        epic = epic_of(u, units)
+        if epic:
+            lines.append(f"[workdocs] epic: {epic.location}")
+        lines.append("[workdocs] If the user names a different project or ticket, run `wd where <key-or-name>`.")
+        return lines
+    if found:
+        return [f"[workdocs] {where} matches several units: " + ", ".join(u.rel for u in found)
+                + ". Ask the user which one before writing project docs."]
+    return [f"[workdocs] {where} has no mapped project in {root}. Before writing durable notes, "
+            "run `wd where <key-or-name>` or ask the user, then `wd new` / `wd link`."]
+
+
+def cmd_hook(cfg, args) -> int:
+    # Hooks must never fail the session: swallow everything.
+    try:
+        payload = {}
+        # Claude Code sends JSON on stdin; other callers may send nothing, so never block on it.
+        if not sys.stdin.isatty() and select.select([sys.stdin], [], [], 0.5)[0]:
+            raw = sys.stdin.read()
+            if raw.strip():
+                payload = json.loads(raw)
+        cwd = Path(payload.get("cwd") or os.getcwd())
+        if args.event == "session-start":
+            lines = session_start_lines(cfg, cwd)
+            if payload.get("source") == "compact":
+                lines += compact_lines(cfg, payload, cwd)
+            for line in lines:
+                print(line)
+        elif args.event == "session-end":
+            checkpoint(Path(cfg["WORKDOCS_ROOT"]), None, auto=True)
+        elif args.event == "stop":
+            reason = stop_decision(cfg, payload)
+            if reason:
+                print(json.dumps({"decision": "block", "reason": reason}))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="wd", description="workdocs: personal project docs outside code repos")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("root", help="print the content root").set_defaults(func=cmd_root)
+    sub.add_parser("kit", help="print the kit directory (CONVENTIONS.md, templates/)").set_defaults(func=cmd_kit)
+
+    s = sub.add_parser("where", help="resolve the current checkout (or a key/name) to a unit")
+    s.add_argument("terms", nargs="*", help="Jira key or name fragment; overrides branch matching")
+    s.add_argument("--cwd")
+    s.add_argument("--all", action="store_true", help="include status: done")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("-v", "--verbose", action="store_true", help="also print the epic")
+    s.set_defaults(func=cmd_where)
+
+    s = sub.add_parser("new", help="scaffold a project, epic, review, or note")
+    s.add_argument("name", help="directory or file stem, e.g. PROJ-123-short-slug")
+    s.add_argument("--kind", choices=sorted(KINDS), default="project")
+    s.add_argument("--epic", help="create inside this epic (name, key, or path)")
+    s.add_argument("--title")
+    s.add_argument("--jira", help="comma-separated extra keys")
+    s.add_argument("--slug", help="review/note filename suffix")
+    s.add_argument("--no-branch", action="store_true", help="do not record the current branch")
+    s.add_argument("--no-git", action="store_true", help="record neither repo nor branch")
+    s.add_argument("--agent", default="wd", help="name for the first LOG entry")
+    s.set_defaults(func=cmd_new)
+
+    s = sub.add_parser("link", help="map the current repo/branch to a project")
+    s.add_argument("unit")
+    s.add_argument("--cwd")
+    s.add_argument("--force", action="store_true", help="allow trunk branches")
+    s.set_defaults(func=cmd_link)
+
+    s = sub.add_parser("promote", help="turn a note or review into a project")
+    s.add_argument("file")
+    s.add_argument("--name")
+    s.add_argument("--epic")
+    s.add_argument("--agent", default="wd")
+    s.set_defaults(func=cmd_promote)
+
+    s = sub.add_parser("ls", help="list units (active by default)")
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_ls)
+
+    sub.add_parser("index", help="regenerate INDEX.md").set_defaults(func=cmd_index)
+    s = sub.add_parser("lint", help="check frontmatter, required files, relative links")
+    s.add_argument("--all-links", action="store_true", help="check links in every doc, not only README/HANDOFF/LOG/DECISIONS")
+    s.set_defaults(func=cmd_lint)
+
+    s = sub.add_parser("audit", help="list untracked files in configured checkouts")
+    s.add_argument("repos", nargs="*")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_audit)
+
+    s = sub.add_parser("checkpoint", help="commit all changes in the content root")
+    s.add_argument("-m", "--message")
+    s.add_argument("--auto", action="store_true", help="quiet, timestamp message, no-op when clean")
+    s.set_defaults(func=cmd_checkpoint)
+
+    s = sub.add_parser("data", help="print (and create) the data/ directory for a unit")
+    s.add_argument("unit")
+    s.set_defaults(func=cmd_data)
+
+    s = sub.add_parser("hook", help="agent hook entry points (never fail)")
+    s.add_argument("event", choices=["session-start", "session-end", "stop"])
+    s.set_defaults(func=cmd_hook)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(load_config(), args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
