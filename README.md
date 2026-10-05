@@ -4,6 +4,10 @@ A convention plus a small CLI for keeping personal project documentation (notes,
 
 The problem it solves: when you work with coding agents across several checkouts and branches, notes pile up as untracked files inside repos, each session starts without knowing what the last one found, and the state of a multi-week investigation lives only in your head. Workdocs puts every project in one place (`~/workdocs`, a local git repo), gives each project a fixed set of files an agent reads first (`HANDOFF.md`) and appends to (`LOG.md`), and maps the branch you are on to the right project automatically.
 
+![workdocs-kit architecture: agent session, the kit, the content root, and the Claude Code hooks](docs/architecture.png)
+
+Source: [docs/architecture.excalidraw](docs/architecture.excalidraw) (open in [excalidraw.com](https://excalidraw.com) to edit).
+
 | Piece | Where | Role |
 |---|---|---|
 | Conventions | [CONVENTIONS.md](CONVENTIONS.md) | the spec: layout, per-project file contract, frontmatter, naming, completion protocol |
